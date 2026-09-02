@@ -1,6 +1,6 @@
 import speech from "@google-cloud/speech";
 import { v2 as translatePkg } from "@google-cloud/translate";
-import record from "node-record-lpcm16";
+import { spawn } from "child_process";
 import axios from "axios";
 import path from "path";
 
@@ -8,10 +8,14 @@ import path from "path";
 // KONFIGURASI SISTEM
 // ==========================================
 const CONFIG = {
-  // Kredensial Google Cloud
+  // Path file kredensial service account Google Cloud
   keyFilename: path.resolve("./google-key.json"),
 
-  // vMix Web API
+  // Nama device audio di Windows (ganti sesuai hasil cek ffmpeg di Step 1)
+  // Contoh: 'Microphone Array (Realtek(R) Audio)' atau 'CABLE Output (VB-Audio Virtual Cable)'
+  audioDeviceName: "Microphone Array (Realtek(R) Audio)",
+
+  // Konfigurasi vMix Web API
   vmixUrl: "http://127.0.0.1:8088/api/",
   titleInputName: "SubtitleIndo", // Nama Input Title di vMix
   textFieldName: "Headline.Text", // Nama Field Text di Title vMix
@@ -20,11 +24,8 @@ const CONFIG = {
   sourceLanguage: "en-US", // Bahasa narsum
   targetLanguage: "id", // Bahasa output terjemahan
 
-  // Timer jeda kosongkan teks saat narsum diam (milidetik)
+  // Timer kosongkan teks otomatis jika narsum diam (milidetik)
   clearDelayMs: 5000,
-
-  // Path ke executable SoX di folder lokal
-  soxPath: path.resolve("./sox.exe"),
 };
 
 // Set Environment Variable Google Cloud
@@ -35,10 +36,10 @@ const translateClient = new translatePkg.Translate();
 
 let clearTimer = null;
 let currentStream = null;
-let audioRecordProcess = null;
+let ffmpegProcess = null;
 
 // ==========================================
-// FUNGSI UPDATE VMIX WEB API
+// FUNGSI UPDATE VMIX TITLE
 // ==========================================
 async function sendToVmix(text) {
   try {
@@ -51,7 +52,7 @@ async function sendToVmix(text) {
       },
     });
 
-    // Reset auto-clear timer
+    // Auto-clear teks di layar jika narsum diam
     if (clearTimer) clearTimeout(clearTimer);
     clearTimer = setTimeout(async () => {
       try {
@@ -63,20 +64,18 @@ async function sendToVmix(text) {
             Value: "",
           },
         });
-      } catch (e) {
-        // Silent fail saat clear
-      }
+      } catch (e) {}
     }, CONFIG.clearDelayMs);
   } catch (err) {
-    console.error(`[vMix Error]: Gagal mengirim ke vMix (${err.message})`);
+    console.error(`[vMix Info]: ${err.message}`);
   }
 }
 
 // ==========================================
-// PIPELINE AUDIO STREAMING & RECONNECT LOOP
+// PIPELINE STREAMING & RECONNECT LOOP
 // ==========================================
 function startStreamPipeline() {
-  console.log("[System]: Memulai streaming audio ke Google Speech-to-Text...");
+  console.log("[System]: Menghubungkan ke Google Streaming STT...");
 
   const requestConfig = {
     config: {
@@ -85,14 +84,13 @@ function startStreamPipeline() {
       languageCode: CONFIG.sourceLanguage,
       enableAutomaticPunctuation: true,
     },
-    interimResults: false, // Menunggu satu frasa/kalimat selesai agar terjemahan akurat
+    interimResults: false, // Kalimat penuh agar terjemahan tidak bolak-balik
   };
 
   currentStream = speechClient
     .streamingRecognize(requestConfig)
     .on("error", (err) => {
-      // Google STT streaming memiliki limit timeout ~5 menit (305s)
-      console.warn(`[STT Warning/Timeout]: ${err.message}`);
+      console.warn(`[STT Timeout/Notice]: ${err.message}`);
       restartPipeline();
     })
     .on("data", async (data) => {
@@ -101,14 +99,11 @@ function startStreamPipeline() {
         console.log(`\n[EN]: ${transcript}`);
 
         try {
-          // Translate English ke Indonesia
           const [translation] = await translateClient.translate(
             transcript,
             CONFIG.targetLanguage
           );
           console.log(`[ID]: ${translation}`);
-
-          // Kirim teks terjemahan ke vMix Title
           await sendToVmix(translation);
         } catch (tErr) {
           console.error(`[Translate Error]: ${tErr.message}`);
@@ -116,44 +111,68 @@ function startStreamPipeline() {
       }
     });
 
-  // Rekam stream mic/VB-Audio Cable menggunakan sox.exe
-  audioRecordProcess = record.record({
-    sampleRate: 16000,
-    threshold: 0,
-    verbose: false,
-    recordProgram: CONFIG.soxPath,
+  // Parameter FFmpeg untuk rekam audio Windows DirectShow (dshow)
+  const ffmpegArgs = [
+    "-f",
+    "dshow",
+    "-i",
+    `audio=${CONFIG.audioDeviceName}`,
+    "-ar",
+    "16000", // 16kHz
+    "-ac",
+    "1", // Mono
+    "-f",
+    "s16le", // Raw PCM 16-bit
+    "pipe:1", // Output langsung ke stdout
+  ];
+
+  ffmpegProcess = spawn("ffmpeg", ffmpegArgs, {
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
   });
 
-  audioRecordProcess.stream().pipe(currentStream);
+  ffmpegProcess.stderr.on("data", (data) => {
+    const msg = data.toString();
+    // Tampilkan jika ada error device tidak ditemukan
+    if (msg.includes("Could not find audio device") || msg.includes("Error")) {
+      console.error(`[FFmpeg Error]: ${msg}`);
+    }
+  });
+
+  ffmpegProcess.on("exit", (code) => {
+    if (code !== null && code !== 0 && code !== 255) {
+      console.warn(`[FFmpeg Exit]: Proses berhenti dengan code ${code}`);
+    }
+  });
+
+  // Alirkan buffer audio langsung ke Google STT
+  ffmpegProcess.stdout.pipe(currentStream);
+
   console.log(
-    "[Ready]: Mendengarkan suara narsum. Tekan Ctrl+C untuk berhenti.\n"
+    `[Ready]: Mic "${CONFIG.audioDeviceName}" aktif! Silakan bicara bahasa Inggris. (Ctrl+C untuk stop)\n`
   );
 }
 
 function restartPipeline() {
-  console.log("[System]: Melakukan refresh streaming session...");
-
+  console.log("[System]: Refreshing session stream...");
   if (currentStream) {
     currentStream.destroy();
     currentStream = null;
   }
-  if (audioRecordProcess) {
-    audioRecordProcess.stop();
-    audioRecordProcess = null;
+  if (ffmpegProcess) {
+    ffmpegProcess.kill("SIGKILL");
+    ffmpegProcess = null;
   }
 
-  // Jeda 500ms sebelum inisialisasi ulang
   setTimeout(() => {
     startStreamPipeline();
   }, 500);
 }
 
-// Handle exit cleanly
 process.on("SIGINT", () => {
-  console.log("\n[System]: Mematikan script translator...");
-  if (audioRecordProcess) audioRecordProcess.stop();
+  console.log("\n[System]: Script dihentikan.");
+  if (ffmpegProcess) ffmpegProcess.kill("SIGKILL");
   process.exit(0);
 });
 
-// Start
 startStreamPipeline();
