@@ -6,7 +6,8 @@
   "scripts": {
     "devices": "node list-devices.js",
     "test-mic": "node test-mic.js",
-    "start": "node index.js"
+    "start": "node index.js",
+    "start:youtube": "node index2.js"
   },
   "keywords": [],
   "author": "",
