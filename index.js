@@ -11,21 +11,24 @@ const CONFIG = {
   // Path file kredensial service account Google Cloud
   keyFilename: path.resolve("./google-key.json"),
 
-  // Nama device audio di Windows (ganti sesuai hasil cek ffmpeg di Step 1)
-  // Contoh: 'Microphone Array (Realtek(R) Audio)' atau 'CABLE Output (VB-Audio Virtual Cable)'
+  // Nama device audio di Windows (sesuaikan dengan mic Anda)
   audioDeviceName: "Microphone Array (Realtek(R) Audio)",
 
   // Konfigurasi vMix Web API
   vmixUrl: "http://127.0.0.1:8088/api/",
   titleInputName: "SubtitleIndo", // Nama Input Title di vMix
-  textFieldName: "Headline.Text", // Nama Field Text di Title vMix
+  textFieldName: "Headline.Text", // Field teks di vMix (menggabungkan 2 baris dengan newline \n)
+
+  // Opsi jika memiliki field baris ke-2 terpisah di vMix Title (set null jika pakai 1 field multiline)
+  textFieldNameLine2: null,
 
   // Bahasa
   sourceLanguage: "en-US", // Bahasa narsum
   targetLanguage: "id", // Bahasa output terjemahan
 
-  // Timer kosongkan teks otomatis jika narsum diam (milidetik)
-  clearDelayMs: 5000,
+  // Parameter Smart Chunking
+  minWordsPerChunk: 6, // Minimal kata sebelum mencari titik potong alami
+  maxWordsPerChunk: 10, // Maksimal kata (potong paksa jika tidak ada jeda)
 };
 
 // Set Environment Variable Google Cloud
@@ -34,48 +37,169 @@ process.env.GOOGLE_APPLICATION_CREDENTIALS = CONFIG.keyFilename;
 const speechClient = new speech.SpeechClient();
 const translateClient = new translatePkg.Translate();
 
-let clearTimer = null;
 let currentStream = null;
 let ffmpegProcess = null;
+let committedLength = 0;
+
+// State untuk 2-line rolling subtitle
+let line1 = ""; // Baris 1 (Atas / Kalimat Sebelumnya)
+let line2 = ""; // Baris 2 (Bawah / Kalimat Terkini)
+let lastTimestamp = null; // Untuk kalkulasi jeda waktu antar-chunk
 
 // ==========================================
 // FUNGSI UPDATE VMIX TITLE
 // ==========================================
-async function sendToVmix(text) {
+async function sendToVmix(l1, l2) {
   try {
-    await axios.get(CONFIG.vmixUrl, {
-      params: {
-        Function: "SetText",
-        Input: CONFIG.titleInputName,
-        SelectedName: CONFIG.textFieldName,
-        Value: text,
-      },
-    });
-
-    // Auto-clear teks di layar jika narsum diam
-    if (clearTimer) clearTimeout(clearTimer);
-    clearTimer = setTimeout(async () => {
-      try {
-        await axios.get(CONFIG.vmixUrl, {
+    if (CONFIG.textFieldNameLine2) {
+      // Jika menggunakan 2 field teks terpisah di template vMix
+      await Promise.all([
+        axios.get(CONFIG.vmixUrl, {
           params: {
             Function: "SetText",
             Input: CONFIG.titleInputName,
             SelectedName: CONFIG.textFieldName,
-            Value: "",
+            Value: l1 || "",
           },
-        });
-      } catch (e) {}
-    }, CONFIG.clearDelayMs);
+        }),
+        axios.get(CONFIG.vmixUrl, {
+          params: {
+            Function: "SetText",
+            Input: CONFIG.titleInputName,
+            SelectedName: CONFIG.textFieldNameLine2,
+            Value: l2 || "",
+          },
+        }),
+      ]);
+    } else {
+      // Mode default: gabungkan baris 1 dan baris 2 dengan newline (\n)
+      const combinedText = l1 ? `${l1}\n${l2}` : l2;
+      await axios.get(CONFIG.vmixUrl, {
+        params: {
+          Function: "SetText",
+          Input: CONFIG.titleInputName,
+          SelectedName: CONFIG.textFieldName,
+          Value: combinedText,
+        },
+      });
+    }
   } catch (err) {
     console.error(`[vMix Info]: ${err.message}`);
   }
 }
 
 // ==========================================
+// ANTRIAN TERJEMAHAN & PROSES KE VMIX
+// ==========================================
+let isProcessingQueue = false;
+const translationQueue = [];
+
+async function processTranslationQueue() {
+  if (isProcessingQueue || translationQueue.length === 0) return;
+  isProcessingQueue = true;
+
+  while (translationQueue.length > 0) {
+    const chunkEn = translationQueue.shift();
+    try {
+      const [translated] = await translateClient.translate(
+        chunkEn,
+        CONFIG.targetLanguage
+      );
+
+      // Geser baris: baris 2 naik ke baris 1, baris baru masuk ke baris 2
+      line1 = line2;
+      line2 = translated;
+
+      const now = new Date();
+      const timeStr =
+        now.toTimeString().split(" ")[0] +
+        "." +
+        String(now.getMilliseconds()).padStart(3, "0");
+      const deltaStr = lastTimestamp
+        ? `(+${((now - lastTimestamp) / 1000).toFixed(2)} detik dari chunk sebelumnya)`
+        : `(Chunk pertama)`;
+      lastTimestamp = now;
+
+      console.log(`\n⏱️  [${timeStr}] ${deltaStr}`);
+      console.log(`[EN Chunk]: "${chunkEn}"`);
+      console.log(`[ID Chunk]: "${translated}"`);
+      console.log(`┌─────────────────────────────────────────────────────────────┐`);
+      console.log(`│ [1. Baris Atas ] : ${(line1 || "-").padEnd(41)}│`);
+      console.log(`│ [2. Baris Bawah] : ${(line2 || "-").padEnd(41)}│`);
+      console.log(`└─────────────────────────────────────────────────────────────┘`);
+
+      // Kirim hasil rolling 2 baris ke vMix
+      await sendToVmix(line1, line2);
+    } catch (err) {
+      console.error(`[Translate Error]: ${err.message}`);
+    }
+  }
+
+  isProcessingQueue = false;
+}
+
+// ==========================================
+// LOGIKA SMART CHUNKING
+// ==========================================
+function extractNextChunk(text, isFinal) {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+
+  const words = trimmed.split(/\s+/);
+  if (words.length === 0 || words[0] === "") return null;
+
+  // Jika narsum berhenti bicara (isFinal = true), ambil semua sisa kata
+  if (isFinal) {
+    return trimmed;
+  }
+
+  // Belum mencapai batas minimum kata, biarkan narsum bicara dulu
+  if (words.length < CONFIG.minWordsPerChunk) {
+    return null;
+  }
+
+  // 1. Cek tanda baca alami (. , ? ! ; :) dari kata ke-4 sampai maxWords
+  for (let i = 4; i < Math.min(words.length, CONFIG.maxWordsPerChunk); i++) {
+    if (/[.,?!;:]$/.test(words[i])) {
+      return words.slice(0, i + 1).join(" ");
+    }
+  }
+
+  // 2. Cek kata sambung alami (conjunctions) dari kata ke-5 sampai maxWords
+  const conjunctions = [
+    "and",
+    "but",
+    "so",
+    "because",
+    "or",
+    "then",
+    "which",
+    "that",
+    "where",
+    "when",
+  ];
+  for (let i = 5; i < Math.min(words.length, CONFIG.maxWordsPerChunk); i++) {
+    const cleanWord = words[i].toLowerCase().replace(/[^a-z]/g, "");
+    if (conjunctions.includes(cleanWord)) {
+      return words.slice(0, i).join(" ");
+    }
+  }
+
+  // 3. Jika sudah mencapai maxWords tanpa jeda, potong paksa di maxWords
+  if (words.length >= CONFIG.maxWordsPerChunk) {
+    return words.slice(0, CONFIG.maxWordsPerChunk).join(" ");
+  }
+
+  return null;
+}
+
+// ==========================================
 // PIPELINE STREAMING & RECONNECT LOOP
 // ==========================================
 function startStreamPipeline() {
-  console.log("[System]: Menghubungkan ke Google Streaming STT...");
+  console.log("[System]: Menghubungkan ke Google Streaming STT (Smart Chunking)...");
+
+  committedLength = 0;
 
   const requestConfig = {
     config: {
@@ -84,7 +208,7 @@ function startStreamPipeline() {
       languageCode: CONFIG.sourceLanguage,
       enableAutomaticPunctuation: true,
     },
-    interimResults: false, // Kalimat penuh agar terjemahan tidak bolak-balik
+    interimResults: true, // AKTIF: Kirim audio real-time saat narsum bicara
   };
 
   currentStream = speechClient
@@ -93,21 +217,44 @@ function startStreamPipeline() {
       console.warn(`[STT Timeout/Notice]: ${err.message}`);
       restartPipeline();
     })
-    .on("data", async (data) => {
-      const transcript = data.results[0]?.alternatives[0]?.transcript?.trim();
-      if (transcript) {
-        console.log(`\n[EN]: ${transcript}`);
+    .on("data", (data) => {
+      const result = data.results[0];
+      if (!result || !result.alternatives || !result.alternatives[0]) return;
 
-        try {
-          const [translation] = await translateClient.translate(
-            transcript,
-            CONFIG.targetLanguage
-          );
-          console.log(`[ID]: ${translation}`);
-          await sendToVmix(translation);
-        } catch (tErr) {
-          console.error(`[Translate Error]: ${tErr.message}`);
+      const fullTranscript = result.alternatives[0].transcript || "";
+      const isFinal = result.isFinal;
+
+      // Reset offset jika Google mereset buffer transkrip
+      if (fullTranscript.length < committedLength) {
+        committedLength = 0;
+      }
+
+      let sub = fullTranscript.slice(committedLength);
+      let remainingText = sub.trim();
+
+      while (remainingText.length > 0) {
+        const chunk = extractNextChunk(remainingText, isFinal);
+        if (!chunk || chunk.trim().length === 0) break;
+
+        // Update pointer posisi karakter yang sudah di-commit
+        const idx = sub.indexOf(chunk);
+        if (idx !== -1) {
+          committedLength += idx + chunk.length;
+          sub = fullTranscript.slice(committedLength);
+          remainingText = sub.trim();
+        } else {
+          break;
         }
+
+        // Masukkan ke antrean terjemahan & vMix
+        translationQueue.push(chunk);
+        processTranslationQueue();
+
+        if (isFinal) break;
+      }
+
+      if (isFinal) {
+        committedLength = 0;
       }
     });
 
@@ -133,7 +280,6 @@ function startStreamPipeline() {
 
   ffmpegProcess.stderr.on("data", (data) => {
     const msg = data.toString();
-    // Tampilkan jika ada error device tidak ditemukan
     if (msg.includes("Could not find audio device") || msg.includes("Error")) {
       console.error(`[FFmpeg Error]: ${msg}`);
     }
@@ -149,7 +295,9 @@ function startStreamPipeline() {
   ffmpegProcess.stdout.pipe(currentStream);
 
   console.log(
-    `[Ready]: Mic "${CONFIG.audioDeviceName}" aktif! Silakan bicara bahasa Inggris. (Ctrl+C untuk stop)\n`
+    `[Ready]: Bot aktif pada mic "${CONFIG.audioDeviceName}"!\n` +
+      `Silakan bicara bahasa Inggris. Teks terjemahan akan otomatis dialirkan ke vMix.\n` +
+      `(Tekan Ctrl+C untuk stop)\n`
   );
 }
 
@@ -163,6 +311,8 @@ function restartPipeline() {
     ffmpegProcess.kill("SIGKILL");
     ffmpegProcess = null;
   }
+
+  committedLength = 0;
 
   setTimeout(() => {
     startStreamPipeline();
