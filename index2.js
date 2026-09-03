@@ -15,7 +15,7 @@ const CONFIG = {
   audioDeviceName: "Microphone Array (Realtek(R) Audio)",
 
   // Konfigurasi vMix Web API
-  vmixUrl: "http://127.0.0.1:8088/api/",
+  vmixUrl: "http://192.168.0.24:8088/api/",
   titleInputName: "SubtitleIndo", // Nama Input Title di vMix
   textFieldName: "Headline.Text", // Field teks di vMix
 
@@ -29,6 +29,9 @@ const CONFIG = {
   // Throttle jeda translate saat narsum bicara (milidetik)
   // Menjaga agar subtitle update berkala tanpa membebani kuota API Translate
   throttleMs: 350,
+
+  // Batas maksimal kata yang muncul bersamaan (mencegah teks kepanjangan di layar)
+  maxWordsPerLine: 8,
 };
 
 // Set Environment Variable Google Cloud
@@ -39,6 +42,7 @@ const translateClient = new translatePkg.Translate();
 
 let currentStream = null;
 let ffmpegProcess = null;
+let committedOffset = 0; // Penanda offset teks yang sudah di-commit/roll
 
 // State untuk 2-line subtitle (Baris 1 = Kalimat Selesai, Baris 2 = Kalimat Berjalan)
 let line1 = ""; // Baris Atas (Previous sentence / sudah final)
@@ -140,20 +144,86 @@ async function executeTranslate(text, isFinal) {
 }
 
 function handleIncomingTranscript(transcript, isFinal) {
-  latestDraftText = transcript.trim();
-  if (!latestDraftText) return;
+  // Jika Google STT mereset buffer atau memulai kalimat baru
+  if (transcript.length < committedOffset) {
+    committedOffset = 0;
+  }
 
-  if (isFinal) {
-    // Jika kalimat sudah final dari Google STT, batalkan timer draf dan kirim langsung
+  let currentSub = transcript.slice(committedOffset);
+  let activeText = currentSub.trim();
+  if (!activeText && !isFinal) return;
+
+  const words = activeText ? activeText.split(/\s+/) : [];
+
+  // Jika kata yang sedang diucapkan sudah mencapai atau melebihi batas maksimal (8 kata)
+  if (words.length >= CONFIG.maxWordsPerLine) {
+    // Cari titik potong alami antara kata ke-10 sampai batas maksimal
+    let splitIdx = CONFIG.maxWordsPerLine;
+    for (let i = 10; i < CONFIG.maxWordsPerLine; i++) {
+      if (/[.,?!;:]$/.test(words[i])) {
+        splitIdx = i + 1;
+        break;
+      }
+    }
+
+    // Jika tidak ada tanda baca, periksa kata sambung
+    if (splitIdx === CONFIG.maxWordsPerLine) {
+      const conjunctions = [
+        "and",
+        "but",
+        "so",
+        "because",
+        "or",
+        "then",
+        "which",
+        "that",
+        "where",
+        "when",
+      ];
+      for (let i = 10; i < CONFIG.maxWordsPerLine; i++) {
+        const cleanWord = words[i].toLowerCase().replace(/[^a-z]/g, "");
+        if (conjunctions.includes(cleanWord)) {
+          splitIdx = i;
+          break;
+        }
+      }
+    }
+
+    const chunkToCommit = words.slice(0, splitIdx).join(" ");
+    const idxInSub = currentSub.indexOf(chunkToCommit);
+    if (idxInSub !== -1) {
+      committedOffset += idxInSub + chunkToCommit.length;
+    }
+
+    // Commit potongan 8 kata ini sebagai FINAL sehingga naik ke Baris Atas (line1)
     if (throttleTimer) {
       clearTimeout(throttleTimer);
       throttleTimer = null;
     }
-    executeTranslate(latestDraftText, true);
+    executeTranslate(chunkToCommit, true);
+
+    // Sisa kata langsung menjadi activeText baru untuk Baris Bawah (line2)
+    currentSub = transcript.slice(committedOffset);
+    activeText = currentSub.trim();
+  }
+
+  if (isFinal) {
+    // Jika narsum berhenti bicara, proses sisa kata dan reset offset
+    if (throttleTimer) {
+      clearTimeout(throttleTimer);
+      throttleTimer = null;
+    }
+    if (activeText) {
+      executeTranslate(activeText, true);
+    }
+    committedOffset = 0;
     return;
   }
 
-  // Jika draf/interim sedang berkembang, batasi frekuensi terjemahan via throttle
+  // Jika masih di bawah batas maksimal 8 kata, update live draft berkala via throttle
+  if (!activeText) return;
+  latestDraftText = activeText;
+
   if (throttleTimer) return;
 
   throttleTimer = setTimeout(() => {
@@ -252,6 +322,8 @@ function restartPipeline() {
     clearTimeout(throttleTimer);
     throttleTimer = null;
   }
+
+  committedOffset = 0;
 
   setTimeout(() => {
     startStreamPipeline();
